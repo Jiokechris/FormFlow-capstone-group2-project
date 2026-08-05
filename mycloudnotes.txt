@@ -1,0 +1,123 @@
+// -- Adding tags to build and deploy (Concept)
+
+Nothing's been changed in your repo just now — this was purely explaining the plan, no files touched beyond the plan doc itself. Here's the "what happens" part broken down simply:
+
+What happened conceptually:
+We decided that a "release" = a git tag. Right now your repo has zero tags — nothing triggers anything yet. The GitHub Actions workflow (which doesn't exist yet either) will be written to say: "whenever a tag matching v*.*.* gets pushed, wake up and do the build/push/deploy dance."
+
+How the setup actually works (once we build it):
+
+You write code, commit, push to main as normal — this does NOT trigger a deploy.
+When you're happy with what's on main and want to ship it, you run:
+
+git tag v1.0.0
+git push origin v1.0.0
+GitHub sees a new tag arrive matching the pattern and fires the workflow. Inside .github/workflows/deploy.yml there'll be a trigger section like:
+
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+
+That workflow then: builds both images → tags them v1.0.0 and the commit SHA → pushes to Docker Hub → SSHes into your VM → pulls the new images → restarts containers.
+Do I alter anything right now? No — this step was just locking in the decision. The actual files that get created/changed later are:
+
+.github/workflows/deploy.yml (new)
+Possibly a small tweak to docker-compose.yml on the VM side to reference the versioned tag instead of latest
+ROLLBACK.md (new, once we do the rollback drill)
+I won't touch any of those until you say go. Want me to move on to confirming the VM/Terraform side next, or start drafting the GitHub Actions workflow now?
+
+// --Setting up Azure Terraform
+
+Good question — let's zoom out. Here's the mental model and how the pieces snap together.
+
+The goal, in one sentence
+Get one Ubuntu computer running in Azure, reachable from the internet on port 80, with Docker already installed on it — so later, GitHub Actions can SSH in and run docker compose up -d to deploy your app.
+
+What Terraform actually is
+Terraform is not a script that runs commands in order. It's a shopping list — you describe what you want to exist, and Terraform figures out how to make Azure match that list. You never say "create a network, then create a subnet" as steps — you just declare both, and Terraform works out the order for you based on what references what.
+
+The order I wrote the files in (and why)
+provider.tf first — before you can order anything, you need to say which store you're shopping at. This tells Terraform "talk to Azure, use this plugin version."
+variables.tf second — the blanks to fill in later (region, VM size, your IP). I wrote these before main.tf so that when writing main.tf, I could just use var.project_name etc. instead of hardcoding values.
+main.tf third — the actual shopping list. This is the biggest file, so let's walk through why it's in this specific order.
+outputs.tf last — "after you've built all that, tell me the IP address," which only makes sense once the VM exists.
+How the pieces in main.tf connect (this is the important part)
+Think of it like assembling a house, outside-in:
+
+
+resource_group          (the empty plot of land / folder)
+   └── virtual_network   (the fence around your property)
+         └── subnet      (a section of that fenced yard)
+               └── network_interface (NIC)   ← the VM's network "cable"
+                     ├── plugs into: subnet
+                     ├── plugs into: public_ip   (the actual internet-facing address)
+                     └── plugs into: NSG (firewall)  ← attached via a separate association resource
+   └── linux_virtual_machine  (the VM itself)
+         └── plugs into: the network_interface above
+         └── runs: user_data.sh on first boot (installs Docker)
+Notice each resource references the one before it by name — e.g. azurerm_subnet.main refers back to azurerm_virtual_network.main.name. That's not me manually sequencing steps; that's Terraform reading "oh, this thing needs that thing to exist first" and building its own dependency graph automatically. You never have to say "do X before Y" — the references are the ordering.
+
+The firewall (NSG) is deliberately separate from the network interface — I created the rules in one resource block, then attached them to the NIC in a second block (azurerm_network_interface_security_group_association). Two steps because in Azure, "the rules" and "which network card they apply to" are genuinely two different concepts.
+
+The VM sits at the very bottom because it needs everything above it to already be defined — it can't plug into a network card that doesn't exist yet.
+
+Where your inputs (terraform.tfvars) fit in
+variables.tf defines the shape of each input (a string, with a description, maybe a default). terraform.tfvars is where you actually supply the real values (like your real IP address). Terraform automatically reads terraform.tfvars and pours those values into the matching variables — no code change needed on your end, ever, once it's set up.
+
+What happens when you actually run the commands
+terraform init — downloads the Azure plugin locally. Nothing touches your Azure account.
+terraform plan — Terraform compares "what you asked for" (the files) against "what currently exists in Azure" (nothing, first time) and prints a preview: "I will create these 7 things." Still nothing happens.
+terraform apply — actually creates them, in the dependency order it worked out from the references, and saves a record of what it made in a terraform.tfstate file (so next time you run plan, it knows what already exists and only changes what's different).
+Want me to save this explanation into the repo too (like the earlier plan doc), or is chat enough for now?
+
+
+// Deployment Handle...
+
+Here's the full picture and what's actually going on in this repo right now:
+
+Current state: Your app (frontend + backend + MySQL via docker-compose.yml) is fully containerized and working locally. But your CI/CD pipeline (.github/workflows/deploy.yaml) is 100% wired for AWS — it builds/pushes images to Docker Hub, then deploys via aws ssm send-command to an EC2 instance. Your terraform-azure/ folder provisions a real Azure VM (network, firewall, Docker pre-installed via cloud-init) — but nothing connects it to the pipeline yet. Azure VMs also don't have AWS SSM, so the deploy mechanism has to change from "SSM command" to "SSH command."
+
+So the path is: provision the Azure VM → switch the pipeline's deploy step from SSM to SSH → wire up secrets → push and verify.
+
+Step-by-step
+1. Prereqs on your machine
+
+Install Azure CLI, run az login
+Generate an SSH keypair if you don't have one: ssh-keygen -t rsa -b 4096 -f ~/.ssh/formflow_azure
+Have a Docker Hub account/token ready (you already reference jioke1 in the workflow)
+2. Provision the Azure VM with Terraform
+
+
+cd terraform-azure
+cp terraform.tfvars.example terraform.tfvars
+Edit terraform.tfvars: set my_ip_cidr (your real IP + /32) and confirm ssh_public_key_path points at the key from step 1.
+
+
+terraform init
+terraform plan
+terraform apply
+This creates the resource group, VNet, NSG (opens 80 + your SSH), and the VM — Docker gets installed automatically via user_data.sh. Note the vm_public_ip output.
+
+3. Decide the deploy mechanism
+Azure has no SSM equivalent by default. The standard replacement is SSH: GitHub Actions SSHes into the VM's public IP using the private key and runs the same docker compose pull && up -d commands the SSM script currently runs. I'd rewrite the "Deploy to EC2 using AWS SSM" step to use an SSH action (e.g. appleboy/ssh-action) instead.
+
+4. GitHub repo secrets to add (replacing the AWS ones)
+
+AZURE_VM_HOST — the public IP from step 2
+AZURE_VM_USER — azureuser
+AZURE_VM_SSH_KEY — the private key content
+Keep: DOCKER_USERNAME, DOCKER_PASSWORD, MYSQL_*, REACT_APP_API_BASE_URL
+Remove/ignore: AWS_*, INSTANCE_ID
+5. Update deploy.yaml
+Same build/push steps stay. Replace the "Configure AWS Credentials" + "Deploy via SSM" steps with an SSH step that: writes .env on the VM, git pull/clone into /opt/capstone/app (already prepped by user_data.sh), then docker compose pull && docker compose up -d.
+
+6. First deploy
+Push to main, watch the Actions run, then hit http://<vm_public_ip>:8080 (per your compose port mapping).
+
+7. Cleanup
+Decide if you're keeping the AWS terraform/ setup around or retiring it — running both costs money for no reason.
+
+Want me to go ahead and rewrite deploy.yaml's deploy step for Azure SSH now? I'd need you to confirm the secret names above before I finalize it, since that determines what you'll set in GitHub.

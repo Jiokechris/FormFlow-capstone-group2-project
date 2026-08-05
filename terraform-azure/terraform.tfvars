@@ -1,0 +1,12 @@
+# Copy this file to terraform.tfvars (no ".example") and fill in your own values.
+# terraform.tfvars is where YOUR personal settings live — it should NOT be
+# committed to git if it contains anything sensitive (it's added to
+# .gitignore already for that reason).
+
+project_name = "formflow"
+location     = "westeurope"
+
+# Find your public IP at https://whatismyip.com and add "/32" to the end.
+# /32 means "exactly this one address, nothing else."
+# my_ip_cidr = "REPLACE_ME/32"
+my_ip_cidr = "105.113.114.51/32"

@@ -1,6 +1,6 @@
 -- Runs automatically on first container start via docker-entrypoint-initdb.d
 -- (MySQL only executes this on an empty data volume — it will NOT re-run on existing data)
-USE school;
+--USE school;
 
 CREATE TABLE IF NOT EXISTS student (
     id INT AUTO_INCREMENT PRIMARY KEY,
